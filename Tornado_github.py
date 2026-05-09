@@ -60,8 +60,12 @@ class tornado_git():
         self.tornado_percentile_min = tornado_percentile_min   # stored for use in predict_new()
         tornado_percentile          = tornado_percentile - tornado_percentile_min
 
-        coef    = np.zeros((12, 12, dim[0], dim_sst[0], dim[1]))
-        predict = np.zeros((int(dim_sst[0]), 12, 12, dim[0], dim[1]))
+        coef      = np.zeros((12, 12, dim[0], dim_sst[0], dim[1]))
+        predict   = np.zeros((int(dim_sst[0]), 12, 12, dim[0], dim[1]))
+        # intercept shape: (12 init_months, 12 pred_months, n_years, n_grid)
+        # Stores model_ols.intercept_ for every LOOCV fold so predict_new()
+        # can restore the full OLS prediction (slopes + intercept + tor_pct_min).
+        intercept = np.zeros((12, 12, dim[0], dim[1]))
 
         for mode in range(1, int(dim_sst[0]) + 1):
             print('working on mode = ' + str(mode))
@@ -108,11 +112,17 @@ class tornado_git():
                             model_ols = linear_model.LinearRegression()
                             model_ols.fit(X_train, Y_train)
                             coef[init_month - 1, month - 1, year - self.init_year, 0:mode, :] = (model_ols.coef_).T
+                            # Save intercept — model_ols.coef_ stores only slopes;
+                            # the intercept is the constant offset (≈ mean of Y_train)
+                            # that must be added back during predict_new().
+                            intercept[init_month - 1, month - 1, year - self.init_year, :] = model_ols.intercept_
                             X_val        = np.zeros((mode, 1))
                             X_val[:, 0]  = np.transpose(series2[0:mode, year - target_init_year])[:]
                             predict[mode - 1, init_month - 1, month - 1, year - self.init_year, :] = \
                                 model_ols.predict(np.transpose(X_val))[0]
 
+        # Store intercept on the instance so predict_new() can access it
+        self.intercept_ = intercept
         return predict, coef
 
     def predict_new(self, sst_pcs, init_month, pred_month, coef, n_modes=None):
@@ -158,10 +168,23 @@ class tornado_git():
                          :,
                          :n_modes, :].mean(axis=0)   # (n_modes, n_tor_months)
 
-        forecast = X @ coef_used                     # (n_tor_months,)  — still in min-removed space
+        forecast = X @ coef_used                     # (n_tor_months,)  — slopes only, min-removed space
 
-        # Add back the per-grid-point minimum so the forecast is in the same
-        # units as the original ECDF percentile (fair comparison with observations)
+        # Add the mean OLS intercept across all LOOCV folds.
+        # During training, LinearRegression(fit_intercept=True) fits:
+        #     Y_pred = X @ coef + intercept   (in min-removed percentile space)
+        # Only coef_ (slopes) was stored; intercept_ was discarded, causing
+        # predict_new() to anchor forecasts at tor_pct_min (the floor) instead
+        # of the climatological mean — producing a persistent negative anomaly bias.
+        # intercept_ ≈ mean(Y_train) = clim_ref − tor_pct_min per grid point.
+        if hasattr(self, 'intercept_'):
+            intercept_used = self.intercept_[init_month - 1,
+                                             pred_month - 1,
+                                             :, :].mean(axis=0)   # (n_tor_months,)
+            forecast = forecast + intercept_used
+
+        # Add back the per-grid-point minimum to restore the original ECDF scale.
+        # Full reconstruction: X @ coef + intercept + tor_pct_min ≈ X @ coef + clim_ref
         if hasattr(self, 'tornado_percentile_min'):
             forecast = forecast + self.tornado_percentile_min
 
