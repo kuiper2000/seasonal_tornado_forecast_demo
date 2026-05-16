@@ -11,7 +11,7 @@ from   sklearn import linear_model
 from   datetime import datetime
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
-regr = linear_model.LinearRegression()
+regr = linear_model.Ridge(alpha=1.0)
 
 
 class tornado_git():
@@ -47,7 +47,24 @@ class tornado_git():
         else:
             return second_year.year
 
-    def _forecast(self, leave_one_out=True, normalize=True):
+    def _forecast(self, leave_one_out=True, normalize=True, ridge_alpha=0.1):
+        """
+        Parameters
+        ----------
+        leave_one_out : bool
+            If True, use LOOCV (one year held out per fold).
+        normalize     : bool
+            If True, use Ridge regression (with L2 penalty ridge_alpha) to fit
+            coefficients in min-removed percentile space.  Ridge shrinks large
+            coefficients toward zero, keeping predictions within the valid
+            quantile-mapping range.  If False, a manual closed-form ridge solve
+            is used instead (see lines below).
+        ridge_alpha   : float
+            L2 regularisation strength passed to sklearn.linear_model.Ridge.
+            Larger values → stronger shrinkage → smaller coefficients.
+            Default: 1.0.  Increase (e.g. 10, 100) if predictions still
+            exceed [tor_pct_min, 1] after fitting.
+        """
         pcs_obs_sst        = self.predictor
         dim                = np.shape(self.tornado)
         dim_sst            = np.shape(self.predictor)
@@ -63,8 +80,6 @@ class tornado_git():
         coef      = np.zeros((12, 12, dim[0], dim_sst[0], dim[1]))
         predict   = np.zeros((int(dim_sst[0]), 12, 12, dim[0], dim[1]))
         # intercept shape: (12 init_months, 12 pred_months, n_years, n_grid)
-        # Stores model_ols.intercept_ for every LOOCV fold so predict_new()
-        # can restore the full OLS prediction (slopes + intercept + tor_pct_min).
         intercept = np.zeros((12, 12, dim[0], dim[1]))
 
         for mode in range(1, int(dim_sst[0]) + 1):
@@ -95,6 +110,7 @@ class tornado_git():
                             series4 = series2
                             series3 = series1
 
+                        # ── Manual closed-form ridge (used when normalize=False) ──
                         regularization = np.std(series4) ** 2
                         ans = np.linalg.inv(
                             series4.dot(series4.T) + regularization * 0.001 * np.eye(series4.shape[0])
@@ -107,19 +123,28 @@ class tornado_git():
                         predict[mode - 1, init_month - 1, month - 1, year - self.init_year, :] = X_val.T.dot(ans)
 
                         if normalize:
-                            Y_train   = series3
-                            X_train   = series4.T
-                            model_ols = linear_model.LinearRegression()
-                            model_ols.fit(X_train, Y_train)
-                            coef[init_month - 1, month - 1, year - self.init_year, 0:mode, :] = (model_ols.coef_).T
-                            # Save intercept — model_ols.coef_ stores only slopes;
-                            # the intercept is the constant offset (≈ mean of Y_train)
-                            # that must be added back during predict_new().
-                            intercept[init_month - 1, month - 1, year - self.init_year, :] = model_ols.intercept_
-                            X_val        = np.zeros((mode, 1))
-                            X_val[:, 0]  = np.transpose(series2[0:mode, year - target_init_year])[:]
+                            Y_train = series3
+                            X_train = series4.T
+
+                            # ── Ridge regression replaces plain OLS ───────────────
+                            # Ridge adds L2 penalty (alpha * ||coef||^2) to the
+                            # least-squares loss, shrinking large coefficients toward
+                            # zero.  This prevents predictions from straying far
+                            # outside the quantile-mapping bounds [tor_pct_min, 1].
+                            model_ridge = linear_model.Ridge(alpha=ridge_alpha,
+                                                             fit_intercept=True)
+                            model_ridge.fit(X_train, Y_train)
+
+                            coef[init_month - 1, month - 1, year - self.init_year, 0:mode, :] = \
+                                (model_ridge.coef_).T
+                            # Save intercept (≈ mean of Y_train in min-removed space)
+                            intercept[init_month - 1, month - 1, year - self.init_year, :] = \
+                                model_ridge.intercept_
+
+                            X_val       = np.zeros((mode, 1))
+                            X_val[:, 0] = np.transpose(series2[0:mode, year - target_init_year])[:]
                             predict[mode - 1, init_month - 1, month - 1, year - self.init_year, :] = \
-                                model_ols.predict(np.transpose(X_val))[0]
+                                model_ridge.predict(np.transpose(X_val))[0]
 
         # Store intercept on the instance so predict_new() can access it
         self.intercept_ = intercept
@@ -170,13 +195,7 @@ class tornado_git():
 
         forecast = X @ coef_used                     # (n_tor_months,)  — slopes only, min-removed space
 
-        # Add the mean OLS intercept across all LOOCV folds.
-        # During training, LinearRegression(fit_intercept=True) fits:
-        #     Y_pred = X @ coef + intercept   (in min-removed percentile space)
-        # Only coef_ (slopes) was stored; intercept_ was discarded, causing
-        # predict_new() to anchor forecasts at tor_pct_min (the floor) instead
-        # of the climatological mean — producing a persistent negative anomaly bias.
-        # intercept_ ≈ mean(Y_train) = clim_ref − tor_pct_min per grid point.
+        # Add the mean Ridge intercept across all LOOCV folds.
         if hasattr(self, 'intercept_'):
             intercept_used = self.intercept_[init_month - 1,
                                              pred_month - 1,
@@ -184,11 +203,12 @@ class tornado_git():
             forecast = forecast + intercept_used
 
         # Add back the per-grid-point minimum to restore the original ECDF scale.
-        # Full reconstruction: X @ coef + intercept + tor_pct_min ≈ X @ coef + clim_ref
         if hasattr(self, 'tornado_percentile_min'):
             forecast = forecast + self.tornado_percentile_min
 
-        # Clip to [0, 1] — by definition a percentile cannot be outside this range
+        # Clip to [0, 1] — by definition a percentile cannot be outside this range.
+        # With Ridge regularisation the raw predictions should be much closer to
+        # this range already; the clip handles any residual edge cases.
         forecast = np.clip(forecast, 0.0, 1.0)
 
         return forecast, coef_used
